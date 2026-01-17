@@ -2,9 +2,11 @@
 
 A raw, flexible wrapper node for running local `llama.cpp` binaries directly within ComfyUI.
 
-This is not a model loader. It does not load weights into ComfyUI's VRAM management. It a node that connects to the included bridge that executes your local `llama-cli` or `llama-completion` binary, passes the prompt and flags, and returns the stdout string.
+This is not a model loader. It does not load weights into ComfyUI's VRAM management. It is a node that connects to the included bridge that executes your local `llama-cli` or `llama-completion` binary, passes the prompt and flags, and returns the stdout string.
 
-Useful if you want full control over `llama.cpp` flags (layer offloading, context shifting, specific samplers) or if you are running experimental builds/models (like GLM-4.whatever) that aren't fully supported by standard or stupid ollama or one of the many llama nodes yet.
+Useful if you want full control over `llama.cpp` flags (layer offloading, context shifting, specific samplers) or if you are running experimental builds/models (like GLM-4.whatever) that aren't fully supported by standard or stupid ollama or one of the many llama nodes yet. 
+
+My use case: I use it for prompt enhancement with manually formatted <|system|> <|assistant|> <|user|> or however your gguf wants it, using a text search and replace prior to this node to insert my prompt.
 
 ## Prerequisites
 
