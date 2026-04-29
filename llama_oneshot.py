@@ -95,6 +95,7 @@ class LlamaOneShotNode:
             r'^common_perf', r'^sampler', r'^system_info', r'^main:',
             r'^generate: n_ctx', r'^print_info:', r'^load:', r'^sched_reserve:',
             r'^load_tensors:', r'^common_init', r'^llama_memory', 
+            r'^common_memory_breakdown_print:',
             r'^\.+', r'^\s*(repeat_last_n|dry_multiplier|top_k|mirostat)'
         ]
         
