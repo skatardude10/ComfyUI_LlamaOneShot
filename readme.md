@@ -1,78 +1,66 @@
 # ComfyUI-Llama-OneShot
 
-A raw, flexible wrapper node for running local `llama.cpp` binaries directly within ComfyUI.
+Run local `llama.cpp` binaries from ComfyUI. The node sends prompt + flags to a small local bridge, the bridge runs your binary once and returns the output.
 
-This is not a model loader. It does not load weights into ComfyUI's VRAM management. It is a node that connects to the included bridge that executes your local `llama-cli` or `llama-completion` binary, passes the prompt and flags, and returns the stdout string.
+This is not a model loader. It does not manage VRAM. Each run loads the model, generates, then exits and frees VRAM.
 
-Useful if you want full control over `llama.cpp` flags (layer offloading, context shifting, specific samplers) or if you are running experimental builds/models (like GLM-4.whatever) that aren't fully supported by standard or stupid ollama or one of the many llama nodes yet. 
+You need a working `llama.cpp` build (or `ik_llama.cpp`).
 
-My use case: I use it for prompt enhancement with manually formatted <|system|> <|assistant|> <|user|> or however your gguf wants it, using a text search and replace prior to this node to insert my prompt.
+## Setup
 
-## Prerequisites
-
-1.  **llama.cpp**: You must have a working, compiled version of [llama.cpp](https://github.com/ggerganov/llama.cpp) or something like ik_llama.cpp.
-2.  **Python**: Standard ComfyUI environment.
-
-## Installation
-
-1.  Clone this repo into your `custom_nodes` folder:
-    ```bash
-    git clone https://github.com/skatardude10/ComfyUI-Llama-OneShot.git
-    ```
-2.  Restart ComfyUI.
-
-## Usage (Step-by-Step)
-
-This node requires a "Bridge" script to run in the background. This avoids ComfyUI blocking and handles the system calls to your binary.
-
-### 1. Start the Bridge
-Open a terminal inside this node's folder and run:
+1. Clone into `custom_nodes`, restart ComfyUI.
+2. Run the bridge:
 ```bash
 python llama_bridge.py
 ```
-*   This starts a local server on port `5050`.
-*   It listens **only** on `127.0.0.1` for security.
-*   **Keep this terminal open** while using the node.
+Listens on `http://127.0.0.1:5050`. Keep it running. Unix only (needs `pty`).
 
-### 2. Configure the Node
-Add the **Llama.cpp One-Shot CLI** node to your workflow.
+## Node fields
 
-*   **Prompt**: The text to send to the model.
-*   **Binary Path**: The absolute path to your executable.
-    *   *Example:* `/home/user/llama.cpp/build/bin/llama-cli`
-    *   *Example:* `C:\AI\llama.cpp\build\bin\llama-completion.exe`
-*   **Flags**: The exact command line arguments you would use in a terminal to the binary.
-    *   **Must include** `-m /path/to/model.gguf`
-*   **Bridge URL**: Leave as `http://127.0.0.1:5050` unless you changed the port in the python script.
+- **Prompt**: full prompt text (chat template applied by the binary with `--jinja`).
+- **Binary Path**: absolute path, e.g. `/path/to/llama.cpp/build/bin/llama-completion`
+- **Flags**: CLI args for the binary. Must include `-m /path/to/model.gguf`.
+- **Bridge URL**: keep `http://127.0.0.1:5050`. Local only — remote URLs are rejected.
+- **Timeout**: seconds, default 1200. Kills hung runs.
 
-## Examples
+Returns: Final Text, Thinking, Raw Log. Raw is the full stdout for debug.
 
-### Chat / Instruct (llama-cli)
-**Binary:** `/path/to/llama-cli`
+## Sane starting flags
 
-**Flags:**
+Keep it minimal. Let `llama.cpp` pick context and offload unless you need to override:
+
 ```text
--m /models/Llama-3-8B-Instruct.gguf -c 8192 -ngl 99 --temp 0.7 --top-k 40 --top-p 0.9 --no-display-prompt -cnv -p "You are a helpful assistant."
+-m /path/to/model.gguf --jinja --no-display-prompt -no-cnv -st
 ```
 
-### Raw Completion / GLM-4 (llama-completion)
-**Binary:** `/path/to/llama-completion`
+Why these:
 
-**Flags:**
+- `--jinja`: use the model's own chat template. Works across ChatML, Gemma, Llama without hard-coding.
+- `--no-display-prompt`: don't echo the prompt into stdout. Keeps parsing clean.
+- `-no-cnv`: no conversation loop. Run once and exit. Without this the binary stays interactive and holds VRAM.
+- `-st`: single turn, then exit. Same reason — free VRAM for the next run.
+
+Add your own on top:
+
 ```text
--m /models/GLM-4-9B.gguf -c 32768 -ngl 99 --temp 0.8 --min-p 0.05 --repeat-penalty 1.0 --no-display-prompt -no-cnv -mli -sp -r "<|user|>" -r "<|end_of_text|>"
+-m /path/to/model.gguf --jinja --no-display-prompt -no-cnv -st -c 32768 -ngl 99 --temp 0.8 --top-p 0.95 -n 2000 -s 1234 -r "<end_of_turn>,<turn|>"
 ```
 
-### Advanced Split Offloading
-You can use complex regex for CPU/GPU splitting just like in the CLI:
-```text
--m /models/Heavy-Model-Q2_K.gguf -ngl 99 -ctv q8_0 -ctk q8_0 -ot .((1[8-9]|[2-9][0-9]).ffn_(down|up)_exps.weight)=CPU --xtc-threshold 0.1 --xtc-probability 0.4
-```
+Notes:
 
-## Security Note
+- `-c`, `-ngl`, `-ctk/-ctv`, `--n-cpu-moe`, `--split-mode` depend on your GPU and model. Omit them to use auto.
+- `-r` takes one comma-separated value: `-r "<end_of_turn>,<turn|>"`. Multiple `-r` flags only keep the last.
+- `-s` is seed. `-s -1` = random.
+- MoE example: add `--n-cpu-moe 0 -ctk q8_0 -ctv q8_0 --split-mode none --main-gpu 0`.
+- Dense example: `-c 32768 -ngl 99` is a common starting point if you have the VRAM.
 
-The `llama_bridge.py` script executes shell commands.
-1.  It includes a whitelist allowing only specific binaries (`llama-cli`, `llama-completion`, `main`, `server`).
-2.  It restricts access to `localhost`.
+## Security
 
-However, as with any tool that executes binaries, run this only on a machine you control.
+The bridge runs binaries. It:
+
+- only listens on `127.0.0.1`, checks `Host` and requires `Content-Type: application/json`,
+- only allows filenames `llama-cli`, `llama-completion`, `llama-server`, `main`, `server`, and the file must exist and be executable,
+- rejects `-p/--prompt/-f/--file` in flags (prompt is appended by the bridge),
+- `llama-server` prints a warning — it stays resident and holds VRAM, prefer `llama-completion` for one-shot.
+
+Run only on a machine you control. Don't point the node at a remote bridge URL.

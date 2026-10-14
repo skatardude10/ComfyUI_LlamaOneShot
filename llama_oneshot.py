@@ -1,13 +1,13 @@
 import urllib.request
-import urllib.error
 import json
 import tempfile
 import numpy as np
 import re
 import os
+from urllib.parse import urlparse
 from PIL import Image
 
-print("LOADING: LlamaOneShotNode v15 (Prompt Echo Stripper + Universal Log Cleanup)...")
+print("LOADING: LlamaOneShotNode v17 (robust parsing + timeouts)...")
 
 class LlamaOneShotNode:
     def __init__(self):
@@ -19,10 +19,11 @@ class LlamaOneShotNode:
             "required": {
                 "prompt": ("STRING", {"default": "", "multiline": True}),
                 "binary_path": ("STRING", {"default": "/path/to/llama-cli"}),
-                "flags": ("STRING", {"default": "-m /path/to/model.gguf -c 32768 -ngl 99 -st --simple-io", "multiline": True}),
+                "flags": ("STRING", {"default": "-m /path/to/model.gguf --jinja --no-display-prompt -no-cnv -st", "multiline": True}),
                 "bridge_url": ("STRING", {"default": "http://127.0.0.1:5050"}),
             },
             "optional": {
+                "timeout": ("INT", {"default": 1200, "min": 30, "max": 7200}),
                 "image_1": ("IMAGE",),
                 "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
@@ -37,48 +38,73 @@ class LlamaOneShotNode:
     FUNCTION = "generate"
     CATEGORY = "LlamaOneShot"
 
-    def generate(self, prompt, binary_path, flags, bridge_url, **kwargs):
+    def generate(self, prompt, binary_path, flags, bridge_url, timeout=1200, **kwargs):
+        try:
+            u = urlparse(bridge_url)
+            if u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost"):
+                return ("NODE ERROR: bridge_url must be local (http://127.0.0.1 or http://localhost) to avoid leaking prompts/images.", "", "")
+            try:
+                port = u.port
+            except ValueError:
+                return ("NODE ERROR: bridge_url must be local (http://127.0.0.1 or http://localhost) to avoid leaking prompts/images.", "", "")
+            if port is not None and not (1 <= port <= 65535):
+                return ("NODE ERROR: bridge_url must be local (http://127.0.0.1 or http://localhost) to avoid leaking prompts/images.", "", "")
+        except Exception:
+            return ("NODE ERROR: bad bridge_url.", "", "")
+        try:
+            timeout = int(timeout)
+        except Exception:
+            timeout = 1200
+        timeout = max(30, min(timeout, 7200))
         image_paths =[]
-        
-        for i in range(1, 7):
-            img_key = f"image_{i}"
-            if img_key in kwargs and kwargs[img_key] is not None:
-                img_batch = kwargs[img_key]
-                for i_batch in range(img_batch.shape[0]):
-                    img_tensor = 255. * img_batch[i_batch].cpu().numpy()
-                    img = Image.fromarray(np.clip(img_tensor, 0, 255).astype(np.uint8))
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png", mode='wb') as f:
-                        img.save(f)
-                        image_paths.append(f.name)
-        
-        payload = {
-            "binary_path": binary_path,
-            "flags": flags,
-            "prompt": prompt,
-            "image_paths": image_paths, 
-            "image_path": image_paths[0] if len(image_paths) > 0 else "" 
-        }
-
-        data_json = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(bridge_url, data=data_json, headers={'Content-Type': 'application/json'})
 
         try:
-            with urllib.request.urlopen(req) as response:
-                response_body = response.read().decode('utf-8')
-                data = json.loads(response_body)
-            
-            if "error" in data:
-                return (f"BRIDGE ERROR: {data['error']}", "", str(data))
+            for i in range(1, 7):
+                img_key = f"image_{i}"
+                if img_key in kwargs and kwargs[img_key] is not None:
+                    img_batch = kwargs[img_key]
+                    for i_batch in range(img_batch.shape[0]):
+                        img_tensor = 255. * img_batch[i_batch].cpu().numpy()
+                        img = Image.fromarray(np.clip(img_tensor, 0, 255).astype(np.uint8))
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png", mode='wb') as f:
+                            img.save(f)
+                            image_paths.append(f.name)
 
-            raw_output = data.get("stdout", "")
-            final_text, thinking_text = self.parse_v15(raw_output)
+            payload = {
+                "binary_path": binary_path,
+                "flags": flags,
+                "prompt": prompt,
+                "timeout": timeout,
+                "image_paths": image_paths,
+                "image_path": image_paths[0] if len(image_paths) > 0 else ""
+            }
 
-            return (final_text, thinking_text, raw_output)
+            data_json = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(bridge_url, data=data_json, headers={'Content-Type': 'application/json'})
 
-        except Exception as e:
-            return (f"NODE ERROR: {e}", "", str(e))
+            try:
+                with urllib.request.urlopen(req, timeout=timeout + 30) as response:
+                    response_body = response.read().decode('utf-8')
+                    data = json.loads(response_body)
 
-    def parse_v15(self, raw_text):
+                if "error" in data:
+                    return (f"BRIDGE ERROR: {data['error']}", "", str(data))
+
+                raw_output = data.get("stdout", "")
+                final_text, thinking_text = self.parse_v16(raw_output)
+
+                return (final_text, thinking_text, raw_output)
+
+            except Exception as e:
+                return (f"NODE ERROR: {e}", "", str(e))
+        finally:
+            for p in image_paths:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+
+    def parse_v16(self, raw_text):
         # 1. Clean ANSI and ASCII Blobs
         text = re.sub(r'\x1b\[[0-9;]*m', '', raw_text)
         text = re.sub(r'[\u2580-\u259F]', '', text)
@@ -88,24 +114,33 @@ class LlamaOneShotNode:
         cleaned_lines = []
         
         log_patterns =[
-            r'^ggml_', r'^llama_', r'^Device \d', r'^Loading model', 
-            r'^build\s+:', r'^model\s+:', r'^modalities\s+:', 
-            r'^available commands:', r'^\s*/\w+',  # Catches all CLI interactive help commands (/glob, /help, etc)
-            r'^Loaded media', r'^Exiting', 
+            r'^ggml_', r'^llama_', r'^llama_completion', r'^cmn', r'^common_',
+            r'^DEPRECATED', r'^model has',
+            r'^Device \d', r'^Loading model',
+            r'^build\s+:', r'^model\s+:', r'^modalities\s+:',
+            r'^available commands:',
+            r'^\s*/(help|clear|load|save|exit|quit|rerun|glob|models|chat|stop|prefix|suffix)\b',
+            r'^Loaded media', r'^Exiting',
             r'^common_perf', r'^sampler', r'^system_info', r'^main:',
             r'^generate: n_ctx', r'^print_info:', r'^load:', r'^sched_reserve:',
-            r'^load_tensors:', r'^common_init', r'^llama_memory', 
+            r'^load_tensors:', r'^common_init', r'^llama_memory',
             r'^common_memory_breakdown_print:',
-            r'^\.+', r'^\s*(repeat_last_n|dry_multiplier|top_k|mirostat)'
+            r'^\.+\s*$', r'^\s*(repeat_last_n|dry_multiplier|top_k|mirostat)'
         ]
-        
+
         for line in lines:
             stripped = line.strip()
-            if any(re.match(p, line) or re.match(p, stripped) for p in log_patterns):
+
+            # skip pure timestamp lines like "0.03.877.701 I" with nothing after
+            if re.match(r'^[\d\.\:]+\s+[A-Za-z]\s*$', stripped):
                 continue
-            if stripped.startswith("> "):
+
+            # Handle llama.cpp timestamp prefixes like "2.13.609.449 I "
+            match_target = re.sub(r'^[\d\.\:]+\s+[A-Za-z]\s+', '', stripped)
+
+            if any(re.match(p, line) or re.match(p, match_target) for p in log_patterns):
                 continue
-            if re.match(r'\[ Prompt: .* \| Generation: .* \]', stripped):
+            if re.match(r'\[ Prompt: .* \| Generation: .* \]', match_target):
                 continue
             cleaned_lines.append(line)
 
@@ -119,7 +154,8 @@ class LlamaOneShotNode:
             # If it wasn't truncated, find the AI's role tag and slice everything before it off.
             role_markers =[
                 r"<start_of_turn>model",   # Gemma
-                r"<\|im_start\|>assistant" # ChatML / Qwen
+                r"<\|im_start\|>assistant", # ChatML / Qwen
+                r"<\|start_header_id\|>assistant", # Llama 3
             ]
             for rm in role_markers:
                 matches = list(re.finditer(rm, text, re.IGNORECASE))
@@ -171,3 +207,6 @@ class LlamaOneShotNode:
         thinking = scrub_final(thinking)
 
         return response, thinking
+
+    # v17 alias (same logic, new name)
+    parse_v17 = parse_v16
